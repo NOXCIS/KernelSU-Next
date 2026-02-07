@@ -73,62 +73,38 @@ static int ksu_sha256(const unsigned char *data, unsigned int datalen,
 static bool check_block(struct file *fp, u32 *size4, loff_t *pos, u32 *offset,
                         unsigned expected_size, const char *expected_sha256)
 {
-	ssize_t rd;
-
-	rd = kernel_read(fp, size4, 0x4, pos); // signer-sequence length
-	if (rd != 0x4) return false;
-	rd = kernel_read(fp, size4, 0x4, pos); // signer length
-	if (rd != 0x4) return false;
-	rd = kernel_read(fp, size4, 0x4, pos); // signed data length
-	if (rd != 0x4) return false;
+	kernel_read(fp, size4, 0x4, pos); // signer-sequence length
+	kernel_read(fp, size4, 0x4, pos); // signer length
+	kernel_read(fp, size4, 0x4, pos); // signed data length
 
 	*offset += 0x4 * 3;
 
-	rd = kernel_read(fp, size4, 0x4, pos); // digests-sequence length
-	if (rd != 0x4) return false;
+	kernel_read(fp, size4, 0x4, pos); // digests-sequence length
 
 	*pos += *size4;
 	*offset += 0x4 + *size4;
 
-	rd = kernel_read(fp, size4, 0x4, pos); // certificates length
-	if (rd != 0x4) return false;
-	rd = kernel_read(fp, size4, 0x4, pos); // certificate length
-	if (rd != 0x4) return false;
+	kernel_read(fp, size4, 0x4, pos); // certificates length
+	kernel_read(fp, size4, 0x4, pos); // certificate length
 	*offset += 0x4 * 2;
 
 	if (*size4 == expected_size) {
-		char *cert;
-		unsigned char digest[SHA256_DIGEST_SIZE];
-		char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
-
 		*offset += *size4;
 
 #define CERT_MAX_LENGTH 1024
-		if (*size4 > CERT_MAX_LENGTH || *size4 == 0) {
-			pr_info("cert length invalid: %u\n", *size4);
+		char cert[CERT_MAX_LENGTH];
+		if (*size4 > CERT_MAX_LENGTH) {
+			pr_info("cert length overlimit\n");
 			return false;
 		}
-
-		cert = kmalloc(*size4, GFP_KERNEL);
-		if (!cert) {
-			pr_info("cert alloc failed\n");
-			return false;
-		}
-
-		rd = kernel_read(fp, cert, *size4, pos);
-		if (rd != *size4) {
-			pr_info("cert read failed: %zd/%u\n", rd, *size4);
-			kfree(cert);
-			return false;
-		}
-
+		kernel_read(fp, cert, *size4, pos);
+		unsigned char digest[SHA256_DIGEST_SIZE];
 		if (IS_ERR(ksu_sha256(cert, *size4, digest))) {
 			pr_info("sha256 error\n");
-			kfree(cert);
 			return false;
 		}
-		kfree(cert);
 
+		char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
 		hash_str[SHA256_DIGEST_SIZE * 2] = '\0';
 
         bin2hex(hash_str, digest, SHA256_DIGEST_SIZE);
@@ -161,10 +137,8 @@ static bool has_v1_signature_file(struct file *fp)
 	const char MANIFEST[] = "META-INF/MANIFEST.MF";
 
 	loff_t pos = 0;
-	int loop_count = 0;
 
-    while (loop_count++ < 100000 &&
-           kernel_read(fp, &header, sizeof(struct zip_entry_header), &pos) ==
+    while (kernel_read(fp, &header, sizeof(struct zip_entry_header), &pos) ==
            sizeof(struct zip_entry_header)) {
         if (header.signature != 0x04034b50) {
             // ZIP magic: 'PK'
@@ -173,8 +147,7 @@ static bool has_v1_signature_file(struct file *fp)
         // Read the entry file name
         if (header.file_name_length == sizeof(MANIFEST) - 1) {
             char fileName[sizeof(MANIFEST)];
-            if (kernel_read(fp, fileName, header.file_name_length, &pos) != header.file_name_length)
-                return false;
+            kernel_read(fp, fileName, header.file_name_length, &pos);
             fileName[header.file_name_length] = '\0';
 
             // Check if the entry matches META-INF/MANIFEST.MF
@@ -187,13 +160,7 @@ static bool has_v1_signature_file(struct file *fp)
         }
 
 		// Skip to the next entry
-		{
-			loff_t skip = (loff_t)header.extra_field_length +
-				      (loff_t)header.compressed_size;
-			pos += skip;
-		}
-		if (header.extra_field_length == 0 && header.compressed_size == 0 && header.file_name_length == 0)
-			return false;
+		pos += header.extra_field_length + header.compressed_size;
 	}
 
 	return false;
@@ -228,14 +195,10 @@ static __always_inline bool check_v2_signature(char *path,
 	for (i = 0;; ++i) {
 		unsigned short n;
 		pos = generic_file_llseek(fp, -i - 2, SEEK_END);
-		if (pos < 0)
-			goto clean;
-		if (kernel_read(fp, &n, 2, &pos) != 2)
-			goto clean;
+		kernel_read(fp, &n, 2, &pos);
 		if (n == i) {
 			pos -= 22;
-			if (kernel_read(fp, &size4, 4, &pos) != 4)
-				goto clean;
+			kernel_read(fp, &size4, 4, &pos);
 			if ((size4 ^ 0xcafebabeu) == 0xccfbf1eeu) {
 				break;
 			}
@@ -248,25 +211,17 @@ static __always_inline bool check_v2_signature(char *path,
 
 	pos += 12;
 	// offset
-	if (kernel_read(fp, &size4, 0x4, &pos) != 0x4)
-		goto clean;
-	if (size4 < 0x18)
-		goto clean;
+	kernel_read(fp, &size4, 0x4, &pos);
 	pos = size4 - 0x18;
 
-	if (kernel_read(fp, &size8, 0x8, &pos) != 0x8)
-		goto clean;
-	if (kernel_read(fp, buffer, 0x10, &pos) != 0x10)
-		goto clean;
+	kernel_read(fp, &size8, 0x8, &pos);
+	kernel_read(fp, buffer, 0x10, &pos);
 	if (strcmp((char *)buffer, "APK Sig Block 42")) {
 		goto clean;
 	}
 
-	if ((u64)size8 + 0x8 > (u64)size4)
-		goto clean;
 	pos = size4 - (size8 + 0x8);
-	if (kernel_read(fp, &size_of_block, 0x8, &pos) != 0x8)
-		goto clean;
+	kernel_read(fp, &size_of_block, 0x8, &pos);
 	if (size_of_block != size8) {
 		goto clean;
 	}
@@ -275,14 +230,12 @@ static __always_inline bool check_v2_signature(char *path,
     while (loop_count++ < 10) {
         uint32_t id;
         uint32_t offset;
-        if (kernel_read(fp, &size8, 0x8,
-                    &pos) != 0x8) // sequence length
-            goto clean;
+        kernel_read(fp, &size8, 0x8,
+                    &pos); // sequence length
         if (size8 == size_of_block) {
             break;
         }
-        if (kernel_read(fp, &id, 0x4, &pos) != 0x4) // id
-            goto clean;
+        kernel_read(fp, &id, 0x4, &pos); // id
         offset = 4;
         if (id == 0x7109871au) {
             v2_signing_blocks++;
@@ -298,16 +251,6 @@ static __always_inline bool check_v2_signature(char *path,
 #ifdef CONFIG_KSU_DEBUG
 			pr_info("Unknown id: 0x%08x\n", id);
 #endif
-		}
-		/* Guard against integer underflow: if offset exceeds size8, bail */
-		if (size8 < offset) {
-			pr_info("apk_sign: block size underflow\n");
-			goto clean;
-		}
-		/* Guard against loff_t overflow from a crafted APK */
-		if (pos > LLONG_MAX - (loff_t)(size8 - offset)) {
-			pr_info("apk_sign: block position overflow\n");
-			goto clean;
 		}
 		pos += (size8 - offset);
 	}
@@ -403,14 +346,9 @@ int get_pkg_from_apk_path(char *pkg, const char *path)
 	return 0;
 }
 
-bool ksu_is_manager_apk(char *path)
+bool is_manager_apk(char *path)
 {
-#ifdef CONFIG_KSU_SUSFS
-	return (check_v2_signature(path, EXPECTED_SIZE, EXPECTED_HASH) ||
-			check_v2_signature(path, 384, "7e0c6d7278a3bb8e364e0fcba95afaf3666cf5ff3c245a3b63c8833bd0445cc4")); // 5ec1cff
-#else
 #ifdef KSU_MANAGER_PACKAGE
-#endif
 	char pkg[KSU_MAX_PACKAGE_NAME];
 	if (get_pkg_from_apk_path(pkg, path) < 0) {
 		pr_err("Failed to get package name from apk path: %s\n", path);

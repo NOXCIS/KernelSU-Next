@@ -507,6 +507,8 @@ static bool add_filename_trans(struct policydb *db, const char *s,
         return false;
     }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+    /* 5.9+: filename_trans_key / filename_trans_datum with stypes ebitmap */
     struct filename_trans_key key;
     key.ttype = tgt->value;
     key.tclass = cls->value;
@@ -542,6 +544,52 @@ static bool add_filename_trans(struct policydb *db, const char *s,
 
     db->compat_filename_trans_count++;
     return ebitmap_set_bit(&trans->stypes, src->value - 1, 1) == 0;
+#else
+    /* 5.4 and below: struct filename_trans as key, simple datum with otype only.
+     * hashtab is struct hashtab * with 3-param insert. */
+    struct filename_trans *ft_key;
+    struct filename_trans_datum *ft_datum;
+
+    ft_key = kzalloc(sizeof(*ft_key), GFP_ATOMIC);
+    if (!ft_key)
+        return false;
+
+    ft_key->stype = src->value;
+    ft_key->ttype = tgt->value;
+    ft_key->tclass = cls->value;
+    ft_key->name = kstrdup(o, GFP_ATOMIC);
+    if (!ft_key->name) {
+        kfree(ft_key);
+        return false;
+    }
+
+    /* Check if this filename_trans already exists */
+    ft_datum = hashtab_search(db->filename_trans, ft_key);
+    if (ft_datum) {
+        /* Already exists, just update the otype */
+        ft_datum->otype = def->value;
+        kfree((void *)ft_key->name);
+        kfree(ft_key);
+        return true;
+    }
+
+    ft_datum = kzalloc(sizeof(*ft_datum), GFP_ATOMIC);
+    if (!ft_datum) {
+        kfree((void *)ft_key->name);
+        kfree(ft_key);
+        return false;
+    }
+    ft_datum->otype = def->value;
+
+    if (hashtab_insert(db->filename_trans, ft_key, ft_datum)) {
+        kfree(ft_datum);
+        kfree((void *)ft_key->name);
+        kfree(ft_key);
+        return false;
+    }
+
+    return true;
+#endif
 }
 
 static bool add_genfscon(struct policydb *db, const char *fs_name,

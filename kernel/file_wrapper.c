@@ -573,7 +573,7 @@ int ksu_install_file_wrapper(int fd)
     // Use ksu_file_sid to bypass SELinux check.
     // When we call `su` from terminal app, this is useful.
     if (wrapper_sec) {
-        wrapper_sec->sid = ksu_file_sid;
+        wrapper_sec->sid = READ_ONCE(ksu_file_sid);
     }
     // Install open file operation for inode.
     wrapper_inode->i_fop = &ksu_file_wrapper_inode_fops;

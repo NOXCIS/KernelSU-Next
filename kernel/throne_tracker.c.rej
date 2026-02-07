@@ -1,0 +1,18 @@
+@@ -182,7 +182,7 @@
+ 				}
+ 			}
+ 
+-			bool is_manager = is_manager_apk(dirpath);
++			bool is_manager = ksu_is_manager_apk(dirpath);
+ 			pr_info("Found new base.apk at path: %s, is_manager: %d\n",
+ 				dirpath, is_manager);
+ 			if (is_manager) {
+@@ -278,7 +278,7 @@
+ 	return exist;
+ }
+ 
+-void track_throne()
++void ksu_track_throne()
+ {
+ 	struct file *fp =
+ 		ksu_filp_open_compat(SYSTEM_PACKAGES_LIST_PATH, O_RDONLY, 0);

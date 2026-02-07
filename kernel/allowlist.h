@@ -28,6 +28,8 @@ bool __ksu_is_allow_uid_for_current(uid_t uid);
 #define ksu_is_allow_uid_for_current(uid)                                      \
     unlikely(__ksu_is_allow_uid_for_current(uid))
 
+#define KSU_MAX_ALLOW_LIST 128
+
 bool ksu_get_allow_list(int *array, int *length, bool allow);
 
 void ksu_prune_allowlist(bool (*is_uid_exist)(uid_t, char *, void *),
@@ -37,7 +39,7 @@ bool ksu_get_app_profile(struct app_profile *);
 bool ksu_set_app_profile(struct app_profile *, bool persist);
 
 bool ksu_uid_should_umount(uid_t uid);
-struct root_profile *ksu_get_root_profile(uid_t uid);
+bool ksu_get_root_profile(uid_t uid, struct root_profile *out);
 
 static inline bool is_appuid(uid_t uid)
 {

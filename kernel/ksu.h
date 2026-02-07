@@ -12,9 +12,9 @@
 #define EVENT_BOOT_COMPLETED 2
 #define EVENT_MODULE_MOUNTED 3
 
-static inline int startswith(char *s, char *prefix)
+static inline int startswith(const char *s, const char *prefix)
 {
-	return strncmp(s, prefix, strlen(prefix));
+	return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
 static inline int endswith(const char *s, const char *t)
@@ -22,8 +22,8 @@ static inline int endswith(const char *s, const char *t)
 	size_t slen = strlen(s);
 	size_t tlen = strlen(t);
 	if (tlen > slen)
-		return 1;
-	return strcmp(s + slen - tlen, t);
+		return 0;
+	return strcmp(s + slen - tlen, t) == 0;
 }
 
 extern struct cred *ksu_cred;

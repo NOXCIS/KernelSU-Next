@@ -37,7 +37,7 @@ static inline bool is_zygote_isolated_service_uid(uid_t uid)
 static inline bool is_zygote_normal_app_uid(uid_t uid)
 {
     uid %= 100000;
-    return (uid >= 10000 && uid < 19999);
+    return (uid >= 10000 && uid <= 19999);
 }
 
 extern u32 susfs_zygote_sid;
@@ -121,7 +121,8 @@ int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid){
     // - Since ksu maanger app uid is excluded in allow_list_arr, so ksu_uid_should_umount(manager_uid)
     //   will always return true, that's why we need to explicitly check if new_uid belongs to
     //   ksu manager
-    if (ksu_get_manager_appid() == new_uid % PER_USER_RANGE) {
+    if (likely(ksu_is_manager_appid_valid()) &&
+        unlikely(ksu_get_manager_appid() == new_uid % PER_USER_RANGE)) {
         spin_lock_irq(&current->sighand->siglock);
         ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
         spin_unlock_irq(&current->sighand->siglock);

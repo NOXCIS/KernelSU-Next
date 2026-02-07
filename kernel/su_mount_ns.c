@@ -13,6 +13,7 @@
 #include <linux/syscalls.h>
 #include <linux/task_work.h>
 #include <linux/version.h>
+#include <linux/uaccess.h>
 #include <uapi/linux/mount.h>
 
 #include "arch.h"
@@ -20,9 +21,29 @@
 #include "ksu.h"
 #include "su_mount_ns.h"
 
+/* path_mount was introduced in 5.9; on 5.4 use do_mount via kern_path */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
 extern int path_mount(const char *dev_name, struct path *path,
                       const char *type_page, unsigned long flags,
                       void *data_page);
+#else
+#include <linux/fs.h>
+static inline int path_mount(const char *dev_name, struct path *path,
+                             const char *type_page, unsigned long flags,
+                             void *data_page)
+{
+    /* On 5.4, use kern_path + path_umount style approach.
+     * For the MS_PRIVATE|MS_REC case on root, use do_mount with "/" */
+    extern long do_mount(const char *, const char __user *, const char *,
+                         unsigned long, void *);
+    mm_segment_t old_fs = get_fs();
+    long ret;
+    set_fs(KERNEL_DS);
+    ret = do_mount(dev_name, (const char __user *)"/", type_page, flags, data_page);
+    set_fs(old_fs);
+    return (int)ret;
+}
+#endif
 
 #if defined(__aarch64__)
 extern long __arm64_sys_setns(const struct pt_regs *regs);

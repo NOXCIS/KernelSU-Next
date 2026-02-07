@@ -16,7 +16,7 @@
 
 void setup_selinux(const char *, struct cred *);
 
-void ksu_setenforce(bool);
+void setenforce(bool);
 
 bool getenforce();
 

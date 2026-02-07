@@ -37,7 +37,7 @@
 // Permission check functions
 bool only_manager(void)
 {
-	return is_manager();
+	return ksu_is_manager();
 }
 
 bool only_root(void)
@@ -47,7 +47,7 @@ bool only_root(void)
 
 bool manager_or_root(void)
 {
-	return current_uid().val == 0 || is_manager();
+	return current_uid().val == 0 || ksu_is_manager();
 }
 
 bool always_allow(void)
@@ -58,7 +58,7 @@ bool always_allow(void)
 bool allowed_for_su(void)
 {
     bool is_allowed =
-        is_manager() || ksu_is_allow_uid_for_current(current_uid().val);
+        ksu_is_manager() || ksu_is_allow_uid_for_current(current_uid().val);
     return is_allowed;
 }
 
@@ -87,7 +87,7 @@ static int do_get_info(void __user *arg)
 	if (ksuver_override)
 	    cmd.version = ksuver_override;
 
-	if (is_manager()) {
+	if (ksu_is_manager()) {
 		cmd.flags |= 0x2;
 	}
 	cmd.features = KSU_FEATURE_MAX;
@@ -110,18 +110,16 @@ static int do_report_event(void __user *arg)
 
 	switch (cmd.event) {
 	case EVENT_POST_FS_DATA: {
-		static bool post_fs_data_lock = false;
-		if (!post_fs_data_lock) {
-			post_fs_data_lock = true;
+		static atomic_t post_fs_data_done = ATOMIC_INIT(0);
+		if (!atomic_xchg(&post_fs_data_done, 1)) {
 			pr_info("post-fs-data triggered\n");
 			on_post_fs_data();
 		}
 		break;
 	}
 	case EVENT_BOOT_COMPLETED: {
-		static bool boot_complete_lock = false;
-		if (!boot_complete_lock) {
-			boot_complete_lock = true;
+		static atomic_t boot_complete_done = ATOMIC_INIT(0);
+		if (!atomic_xchg(&boot_complete_done, 1)) {
 			pr_info("boot_complete triggered\n");
 			on_boot_completed();
 #ifdef CONFIG_KSU_SUSFS
@@ -131,6 +129,12 @@ static int do_report_event(void __user *arg)
 		break;
 	}
 	case EVENT_MODULE_MOUNTED: {
+		/* M2: Idempotency guard — prevent repeated module_mounted calls */
+		static atomic_t module_mounted_done = ATOMIC_INIT(0);
+		if (atomic_cmpxchg(&module_mounted_done, 0, 1)) {
+			pr_info("module already mounted, ignoring\n");
+			break;
+		}
 		pr_info("module mounted!\n");
 		on_module_mounted();
 		break;
@@ -353,7 +357,7 @@ static int do_set_feature(void __user *arg)
 
 static int do_get_wrapper_fd(void __user *arg)
 {
-    if (!ksu_file_sid) {
+    if (!READ_ONCE(ksu_file_sid)) {
         return -EINVAL;
     }
 
@@ -412,7 +416,7 @@ static int do_manage_mark(void __user *arg)
 		}
 #else
 		if (cmd.pid != 0) {
-			return ret;
+			return -EOPNOTSUPP;
 		}
 #endif // #ifndef CONFIG_KSU_SUSFS
 		break;
@@ -431,7 +435,7 @@ static int do_manage_mark(void __user *arg)
 		}
 #else
 		if (cmd.pid != 0) {
-			return ret;
+			return -EOPNOTSUPP;
 		}
 #endif // #ifndef CONFIG_KSU_SUSFS
 		break;
@@ -462,7 +466,11 @@ static int do_get_hook_mode(void __user *arg)
 {
 	struct ksu_get_hook_mode_cmd cmd = {0};
 
+#ifdef CONFIG_KSU_SUSFS
+	strscpy(cmd.mode, "SUSFS", sizeof(cmd.mode));
+#else
 	strscpy(cmd.mode, "Kprobes", sizeof(cmd.mode));
+#endif
 
 	if (copy_to_user(arg, &cmd, sizeof(cmd))) {
 		pr_err("get_hook_mode: copy_to_user failed\n");
@@ -502,12 +510,12 @@ static int do_nuke_ext4_sysfs(void __user *arg)
 
     ret = strncpy_from_user(mnt, cmd.arg, sizeof(mnt));
     if (ret < 0) {
-        pr_err("nuke ext4 copy mnt failed: %ld\\n", ret);
-        return -EFAULT; // 或者 return ret;
+        pr_err("nuke ext4 copy mnt failed: %ld\n", ret);
+        return ret;
     }
 
     if (ret == sizeof(mnt)) {
-        pr_err("nuke ext4 mnt path too long\\n");
+        pr_err("nuke ext4 mnt path too long\n");
         return -ENAMETOOLONG;
     }
 
@@ -558,7 +566,7 @@ static int add_try_umount(void __user *arg)
         new_entry->umountable = kstrdup(buf, GFP_KERNEL);
         if (!new_entry->umountable) {
             kfree(new_entry);
-            return -1;
+            return -ENOMEM;
         }
 
         down_write(&mount_list_lock);
@@ -571,7 +579,7 @@ static int add_try_umount(void __user *arg)
                 up_write(&mount_list_lock);
                 kfree(new_entry->umountable);
                 kfree(new_entry);
-                return -1;
+                return -EEXIST;
             }
         }
 
@@ -645,22 +653,34 @@ static int add_try_umount(void __user *arg)
         // check for pointer first
         if (!cmd.arg)
             return -EFAULT;
-            
+
         char *user_buf = (char *)cmd.arg;
+        size_t bytes_written = 0;
+        /*
+         * Cap total output to prevent runaway writes if the list
+         * grew between GETSIZE and GETLIST (TOCTOU).  64 KiB is
+         * generous for a mount-path list.
+         */
+        const size_t max_buf = 65536;
 
         down_read(&mount_list_lock);
         list_for_each_entry(entry, &mount_list, list) {
+            size_t entry_len = strlen(entry->umountable) + 1;
 
-            //debug
-            //pr_info("cmd_add_try_umount: entry: %s\n", entry->umountable);
-            
-            if (copy_to_user((char __user *)user_buf, entry->umountable, strlen(entry->umountable) + 1 )) {
+            if (bytes_written + entry_len > max_buf) {
+                up_read(&mount_list_lock);
+                pr_err("cmd_add_try_umount: list exceeds %zu byte cap\n",
+                       max_buf);
+                return -ENOSPC;
+            }
+
+            if (copy_to_user((char __user *)user_buf, entry->umountable, entry_len)) {
                 up_read(&mount_list_lock);
                 return -EFAULT;
             }
 
-            // walk it! +1 for null terminator
-            user_buf = user_buf + strlen(entry->umountable) + 1;
+            user_buf += entry_len;
+            bytes_written += entry_len;
         }
         up_read(&mount_list_lock);
 
@@ -872,13 +892,13 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 		uint64_t u_pptr = 0;
 		uint64_t u_ptr = 0;
 
-		pr_info("sys_reboot: ppptr: 0x%lx \n", (uintptr_t)ppptr);
+		pr_info("sys_reboot: reading uname spoof data\n");
 
 		// arg here is ***, pull out user-space ** via copy_from_user
 		if (copy_from_user(&u_pptr, ppptr, sizeof(u_pptr)))
 			return 0;
 
-		pr_info("sys_reboot: u_pptr: 0x%lx \n", (uintptr_t)u_pptr);
+		pr_info("sys_reboot: read user pointer level 1\n");
 
 		// now we got the __user **
 		// we cannot dereference this as this is __user
@@ -886,7 +906,7 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 		if (copy_from_user(&u_ptr, (void __user *)u_pptr, sizeof(u_ptr)))
 			return 0;
 
-		pr_info("sys_reboot: u_ptr: 0x%lx \n", (uintptr_t)u_ptr);
+		pr_info("sys_reboot: read user pointer level 2\n");
 
 		// for release
 		if (strncpy_from_user(release_buf, (char __user *)u_ptr, sizeof(release_buf)) < 0)
@@ -898,12 +918,19 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 			return 0;
 		version_buf[sizeof(version_buf) - 1] = '\0'; 
 
-		if (original_release_buf[0] == '\0') {
-			struct new_utsname *u_curr = utsname();
-			// we save current version as the original before modifying
-			strncpy(original_release_buf, u_curr->release, sizeof(original_release_buf));
-			strncpy(original_version_buf, u_curr->version, sizeof(original_version_buf));
-			pr_info("sys_reboot: original uname saved: %s %s\n", original_release_buf, original_version_buf);
+		/* M6: Use atomic flag to prevent race on original_*_buf save */
+		{
+			static atomic_t original_saved = ATOMIC_INIT(0);
+			if (!atomic_cmpxchg(&original_saved, 0, 1)) {
+				struct new_utsname *u_curr;
+				down_read(&uts_sem);
+				u_curr = utsname();
+				/* M4: strscpy always NUL-terminates */
+				strscpy(original_release_buf, u_curr->release, sizeof(original_release_buf));
+				strscpy(original_version_buf, u_curr->version, sizeof(original_version_buf));
+				up_read(&uts_sem);
+				pr_info("sys_reboot: original uname saved: %s %s\n", original_release_buf, original_version_buf);
+			}
 		}
 
 		// so user can reset
@@ -917,8 +944,9 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 		struct new_utsname *u = utsname();
 
 		down_write(&uts_sem);
-		strncpy(u->release, release_buf, sizeof(u->release));
-		strncpy(u->version, version_buf, sizeof(u->version));
+		/* M4: strscpy always NUL-terminates */
+		strscpy(u->release, release_buf, sizeof(u->release));
+		strscpy(u->version, version_buf, sizeof(u->version));
 		up_write(&uts_sem);
 
 		// we write our confirmation on **
@@ -936,97 +964,11 @@ static struct kprobe reboot_kp = {
 #else
 int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg)
 {
+	unsigned long arg4 = (unsigned long)(*arg);
+	unsigned long reply = arg4;
+
 	if (magic1 != KSU_INSTALL_MAGIC1) {
 		return -EINVAL;
-	}
-
-	// If magic2 is susfs and current process is root
-	if (magic2 == SUSFS_MAGIC && current_uid().val == 0) {
-#ifdef CONFIG_KSU_SUSFS_SUS_PATH
-		if (cmd == CMD_SUSFS_ADD_SUS_PATH) {
-			susfs_add_sus_path(arg);
-			return 0;
-		}
-		if (cmd == CMD_SUSFS_ADD_SUS_PATH_LOOP) {
-			susfs_add_sus_path_loop(arg);
-			return 0;
-		}
-		if (cmd == CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH) {
-			susfs_set_i_state_on_external_dir(arg);
-			return 0;
-		}
-		if (cmd == CMD_SUSFS_SET_SDCARD_ROOT_PATH) {
-			susfs_set_i_state_on_external_dir(arg);
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SUS_PATH
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-		if (cmd == CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS) {
-			susfs_set_hide_sus_mnts_for_non_su_procs(arg);
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-		if (cmd == CMD_SUSFS_ADD_SUS_KSTAT) {
-			susfs_add_sus_kstat(arg);
-			return 0;
-		}
-		if (cmd == CMD_SUSFS_UPDATE_SUS_KSTAT) {
-			susfs_update_sus_kstat(arg);
-			return 0;
-		}
-		if (cmd == CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY) {
-			susfs_add_sus_kstat(arg);
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
-		if (cmd == CMD_SUSFS_SET_UNAME) {
-			susfs_set_uname(arg);
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
-#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
-		if (cmd == CMD_SUSFS_ENABLE_LOG) {
-			susfs_enable_log(arg);
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
-#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-		if (cmd == CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG) {
-			susfs_set_cmdline_or_bootconfig(arg);
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-		if (cmd == CMD_SUSFS_ADD_OPEN_REDIRECT) {
-			susfs_add_open_redirect(arg);
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-#ifdef CONFIG_KSU_SUSFS_SUS_MAP
-		if (cmd == CMD_SUSFS_ADD_SUS_MAP) {
-			susfs_add_sus_map(arg);
-			return 0;
-		}
-#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
-		if (cmd == CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING) {
-			susfs_set_avc_log_spoofing(arg);
-			return 0;
-		}
-		if (cmd == CMD_SUSFS_SHOW_ENABLED_FEATURES) {
-			susfs_get_enabled_features(arg);
-			return 0;
-		}
-		if (cmd == CMD_SUSFS_SHOW_VARIANT) {
-			susfs_show_variant(arg);
-			return 0;
-		}
-		if (cmd == CMD_SUSFS_SHOW_VERSION) {
-			susfs_show_version(arg);
-			return 0;
-		}
-		return 0;
 	}
 
 	// Check if this is a request to install KSU fd
@@ -1044,7 +986,484 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user 
 			kfree(tw);
 			pr_warn("install fd add task_work failed\n");
 		}
+		return 0;
 	}
+
+	// Toolkit: set manager app ID (root only)
+	if (magic2 == CHANGE_MANAGER_UID) {
+		if (current_uid().val != 0)
+			return 0;
+
+		pr_info("sys_reboot: ksu_set_manager_appid to: %d\n", cmd);
+		ksu_set_manager_appid(cmd);
+
+		if (cmd == ksu_get_manager_appid()) {
+			if (copy_to_user((void __user *)arg4, &reply, sizeof(reply)))
+				pr_info("sys_reboot: reply fail\n");
+		}
+		return 0;
+	}
+
+	// Toolkit: get su log dump (root only)
+	if (magic2 == GET_SULOG_DUMP_V2) {
+		if (current_uid().val != 0)
+			return 0;
+
+		int ret = send_sulog_dump((void __user *)arg4);
+		if (ret)
+			return 0;
+
+		if (copy_to_user((void __user *)arg4, &reply, sizeof(reply)))
+			return 0;
+
+		return 0;
+	}
+
+	// Toolkit: override KSU version (root only)
+	if (magic2 == CHANGE_KSUVER) {
+		if (current_uid().val != 0)
+			return 0;
+
+		pr_info("sys_reboot: ksu_change_ksuver to: %d\n", cmd);
+		ksuver_override = cmd;
+
+		if (copy_to_user((void __user *)arg4, &reply, sizeof(reply)))
+			return 0;
+
+		return 0;
+	}
+
+	// Toolkit: spoof uname (root only)
+	if (magic2 == CHANGE_SPOOF_UNAME) {
+		if (current_uid().val != 0)
+			return 0;
+
+		char release_buf[65];
+		char version_buf[65];
+		static char original_release_buf[65] = {0};
+		static char original_version_buf[65] = {0};
+
+		void __user **ppptr = (void __user **)arg4;
+		uint64_t u_pptr = 0;
+		uint64_t u_ptr = 0;
+
+		if (copy_from_user(&u_pptr, ppptr, sizeof(u_pptr)))
+			return 0;
+		if (copy_from_user(&u_ptr, (void __user *)u_pptr, sizeof(u_ptr)))
+			return 0;
+
+		if (strncpy_from_user(release_buf, (char __user *)u_ptr, sizeof(release_buf)) < 0)
+			return 0;
+		release_buf[sizeof(release_buf) - 1] = '\0';
+
+		if (strncpy_from_user(version_buf, (char __user *)(u_ptr + strlen(release_buf) + 1), sizeof(version_buf)) < 0)
+			return 0;
+		version_buf[sizeof(version_buf) - 1] = '\0';
+
+		/* M6: Use atomic flag to prevent race on original_*_buf save */
+		{
+			static atomic_t original_saved = ATOMIC_INIT(0);
+			if (!atomic_cmpxchg(&original_saved, 0, 1)) {
+				struct new_utsname *u_curr;
+				down_read(&uts_sem);
+				u_curr = utsname();
+				/* M4: strscpy always NUL-terminates */
+				strscpy(original_release_buf, u_curr->release, sizeof(original_release_buf));
+				strscpy(original_version_buf, u_curr->version, sizeof(original_version_buf));
+				up_read(&uts_sem);
+				pr_info("sys_reboot: original uname saved: %s %s\n", original_release_buf, original_version_buf);
+			}
+		}
+
+		if (!strcmp(release_buf, "default") || !strcmp(version_buf, "default")) {
+			memcpy(release_buf, original_release_buf, sizeof(release_buf));
+			memcpy(version_buf, original_version_buf, sizeof(version_buf));
+		}
+
+		pr_info("sys_reboot: spoofing kernel to: %s - %s\n", release_buf, version_buf);
+
+		struct new_utsname *u = utsname();
+		down_write(&uts_sem);
+		/* M4: strscpy always NUL-terminates */
+		strscpy(u->release, release_buf, sizeof(u->release));
+		strscpy(u->version, version_buf, sizeof(u->version));
+		up_write(&uts_sem);
+
+		if (copy_to_user((void __user *)arg4, &reply, sizeof(reply)))
+			return 0;
+
+		return 0;
+	}
+
+	/*
+	 * SUSFS v2.0.0 command dispatch via reboot() supercall.
+	 *
+	 * The v2.0.0 ksu_susfs binary passes a struct pointer as the 4th arg
+	 * to reboot(). Each struct has 'int err' as its LAST field, initialized
+	 * to 255 (ERR_CMD_NOT_SUPPORTED). The kernel must set err=0 on success.
+	 *
+	 * The helper macro SUSFS_SET_ERR writes err=0 at a known byte offset
+	 * from the start of the user struct.
+	 */
+#define SUSFS_SET_ERR(uptr, offset) \
+	do { int __zero = 0; put_user(__zero, (int __user *)((char __user *)(uptr) + (offset))); } while (0)
+
+	/* v2.0.0 struct err field offsets (ARM64) */
+	/* st_susfs_sus_path:     {ulong(8)+char[256]+uint(4)+int err(4)} → offset 268 */
+	/* st_external_dir:       {char[256]+bool(1)+pad(3)+int cmd(4)+int err(4)} → offset 264 */
+	/* st_susfs_sus_mount:    {char[256]+ulong(8)+int err(4)} → offset 264 */
+	/* st_susfs_hide_*:       {bool(1)+pad(3)+int err(4)} → offset 4 */
+	/* st_susfs_sus_kstat:    {bool(1)+pad(7)+ulong(8)+char[256]+ulong(8)+ulong(8)+uint(4)+pad(4)+ll(8)+6*long(48)+ulong(8)+ull(8)+int err(4)} → offset 368 */
+	/* st_susfs_try_umount:   {char[256]+int(4)+int err(4)} → offset 260 */
+	/* st_susfs_uname:        {char[65]+char[65]+pad(2)+int err(4)} → offset 132 */
+	/* st_susfs_log:          {bool(1)+pad(3)+int err(4)} → offset 4 */
+	/* st_susfs_cmdline:      {char[8192]+int err(4)} → offset 8192 */
+	/* st_susfs_open_redirect:{ulong(8)+char[256]+char[256]+int err(4)} → offset 520 */
+	/* st_susfs_sus_map:      {char[256]+int err(4)} → offset 256 */
+	/* st_susfs_avc_log:      {bool(1)+pad(3)+int err(4)} → offset 4 */
+	if (magic2 == SUSFS_MAGIC && current_uid().val == 0) {
+		void __user *uptr = (void __user *)(*arg);
+#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+		if (cmd == CMD_SUSFS_ADD_SUS_PATH) {
+			susfs_add_sus_path((struct st_susfs_sus_path __user *)uptr);
+			SUSFS_SET_ERR(uptr, 268);
+			return 0;
+		}
+		if (cmd == CMD_SUSFS_ADD_SUS_PATH_LOOP) {
+			susfs_add_sus_path_loop(arg);
+			SUSFS_SET_ERR(uptr, 268);
+			return 0;
+		}
+		if (cmd == CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH ||
+		    cmd == CMD_SUSFS_SET_SDCARD_ROOT_PATH) {
+			susfs_set_i_state_on_external_dir(arg);
+			SUSFS_SET_ERR(uptr, 264);
+			return 0;
+		}
+#endif //#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+		if (cmd == CMD_SUSFS_ADD_SUS_MOUNT) {
+			susfs_add_sus_mount((struct st_susfs_sus_mount __user *)uptr);
+			SUSFS_SET_ERR(uptr, 264);
+			return 0;
+		}
+		if (cmd == CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS) {
+			susfs_set_hide_sus_mnts_for_non_su_procs(arg);
+			SUSFS_SET_ERR(uptr, 4);
+			return 0;
+		}
+#endif //#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+		if (cmd == CMD_SUSFS_ADD_SUS_KSTAT ||
+		    cmd == CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY) {
+			susfs_add_sus_kstat((struct st_susfs_sus_kstat __user *)uptr);
+			SUSFS_SET_ERR(uptr, 368);
+			return 0;
+		}
+		if (cmd == CMD_SUSFS_UPDATE_SUS_KSTAT) {
+			susfs_update_sus_kstat((struct st_susfs_sus_kstat __user *)uptr);
+			SUSFS_SET_ERR(uptr, 368);
+			return 0;
+		}
+#endif //#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+		if (cmd == CMD_SUSFS_ADD_TRY_UMOUNT) {
+			susfs_add_try_umount((struct st_susfs_try_umount __user *)uptr);
+			SUSFS_SET_ERR(uptr, 260);
+			return 0;
+		}
+#endif //#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+		if (cmd == CMD_SUSFS_SET_UNAME) {
+			susfs_set_uname((struct st_susfs_uname __user *)uptr);
+			SUSFS_SET_ERR(uptr, 132);
+			return 0;
+		}
+#endif //#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+		if (cmd == CMD_SUSFS_ENABLE_LOG) {
+			susfs_enable_log(arg);
+			SUSFS_SET_ERR(uptr, 4);
+			return 0;
+		}
+#endif //#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+		if (cmd == CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG) {
+			susfs_set_cmdline_or_bootconfig((char __user *)uptr);
+			SUSFS_SET_ERR(uptr, 8192);
+			return 0;
+		}
+#endif //#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+		if (cmd == CMD_SUSFS_ADD_OPEN_REDIRECT) {
+			susfs_add_open_redirect((struct st_susfs_open_redirect __user *)uptr);
+			SUSFS_SET_ERR(uptr, 520);
+			return 0;
+		}
+#endif //#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+		if (cmd == CMD_SUSFS_ADD_SUS_MAP) {
+			susfs_add_sus_map(arg);
+			SUSFS_SET_ERR(uptr, 256);
+			return 0;
+		}
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
+		if (cmd == CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING) {
+			susfs_set_avc_log_spoofing(arg);
+			SUSFS_SET_ERR(uptr, 4);
+			return 0;
+		}
+		/* show commands - handled directly by susfs_* functions which
+		 * write data + err into the v2.0.0 struct themselves */
+		if (cmd == CMD_SUSFS_SHOW_ENABLED_FEATURES) {
+			susfs_get_enabled_features(arg);
+			return 0;
+		}
+		if (cmd == CMD_SUSFS_SHOW_VARIANT) {
+			susfs_show_variant(arg);
+			return 0;
+		}
+		if (cmd == CMD_SUSFS_SHOW_VERSION) {
+			susfs_show_version(arg);
+			return 0;
+		}
+		return 0;
+	}
+#undef SUSFS_SET_ERR
+
+	return 0;
+}
+
+/*
+ * Handle SUSFS commands via prctl() for compatibility with the ksu_susfs
+ * userspace tool (v1.5.x) which uses prctl(0xDEADBEEF, CMD, ...) instead
+ * of the reboot() supercall interface used by the dev_susfs branch.
+ *
+ * prctl signature: prctl(option, arg2, arg3, arg4, arg5)
+ *   option = 0xDEADBEEF (KERNEL_SU_OPTION)
+ *   arg2   = CMD_SUSFS_* command
+ *   arg3   = data pointer (input/output buffer)
+ *   arg4   = unused (typically NULL)
+ *   arg5   = error return pointer
+ */
+int ksu_handle_prctl_susfs(int option, unsigned long arg2, unsigned long arg3,
+			   unsigned long arg4, unsigned long arg5)
+{
+	int error = 0;
+
+	/* Only root can use SUSFS commands */
+	if (current_uid().val != 0) {
+		return -EACCES;
+	}
+
+#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+	if (arg2 == CMD_SUSFS_ADD_SUS_PATH) {
+		error = susfs_add_sus_path((struct st_susfs_sus_path __user *)arg3);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: CMD_SUSFS_ADD_SUS_PATH -> copy_to_user failed\n");
+		return 0;
+	}
+	if (arg2 == CMD_SUSFS_ADD_SUS_PATH_LOOP) {
+		void __user *uptr = (void __user *)arg3;
+		susfs_add_sus_path_loop(&uptr);
+		error = 0;
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+	if (arg2 == CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH ||
+	    arg2 == CMD_SUSFS_SET_SDCARD_ROOT_PATH) {
+		void __user *uptr = (void __user *)arg3;
+		susfs_set_i_state_on_external_dir(&uptr);
+		error = 0;
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	if (arg2 == CMD_SUSFS_ADD_SUS_MOUNT) {
+		error = susfs_add_sus_mount((struct st_susfs_sus_mount __user *)arg3);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+	if (arg2 == CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS) {
+		void __user *uptr = (void __user *)arg3;
+		susfs_set_hide_sus_mnts_for_non_su_procs(&uptr);
+		error = 0;
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+	if (arg2 == CMD_SUSFS_ADD_SUS_KSTAT) {
+		error = susfs_add_sus_kstat((struct st_susfs_sus_kstat __user *)arg3);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+	if (arg2 == CMD_SUSFS_UPDATE_SUS_KSTAT) {
+		error = susfs_update_sus_kstat((struct st_susfs_sus_kstat __user *)arg3);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+	if (arg2 == CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY) {
+		error = susfs_add_sus_kstat((struct st_susfs_sus_kstat __user *)arg3);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+#endif
+#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+	if (arg2 == CMD_SUSFS_ADD_TRY_UMOUNT) {
+		error = susfs_add_try_umount((struct st_susfs_try_umount __user *)arg3);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+	if (arg2 == CMD_SUSFS_RUN_UMOUNT_FOR_CURRENT_MNT_NS) {
+		/* no-op in v1.5.5 stub */
+		error = 0;
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+#endif
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+	if (arg2 == CMD_SUSFS_SET_UNAME) {
+		error = susfs_set_uname((struct st_susfs_uname __user *)arg3);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+#endif
+#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+	if (arg2 == CMD_SUSFS_ENABLE_LOG) {
+		susfs_set_log(arg3 ? true : false);
+		error = 0;
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+#endif
+#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+	if (arg2 == CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG) {
+		error = susfs_set_cmdline_or_bootconfig((char __user *)arg3);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+#endif
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+	if (arg2 == CMD_SUSFS_ADD_OPEN_REDIRECT) {
+		error = susfs_add_open_redirect((struct st_susfs_open_redirect __user *)arg3);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+#endif
+	if (arg2 == CMD_SUSFS_SHOW_VERSION) {
+		const char *version = SUSFS_VERSION;
+		error = copy_to_user((void __user *)arg3, version, strlen(version) + 1);
+		pr_info("susfs: CMD_SUSFS_SHOW_VERSION -> %s, ret: %d\n", version, error);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+	if (arg2 == CMD_SUSFS_SHOW_ENABLED_FEATURES) {
+		u64 enabled_features = 0;
+#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+		enabled_features |= (1 << 0);
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+		enabled_features |= (1 << 1);
+#endif
+#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+		enabled_features |= (1 << 2);
+#endif
+#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+		enabled_features |= (1 << 3);
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+		enabled_features |= (1 << 4);
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_OVERLAYFS
+		enabled_features |= (1 << 5);
+#endif
+#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+		enabled_features |= (1 << 6);
+#endif
+#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+		enabled_features |= (1 << 7);
+#endif
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+		enabled_features |= (1 << 8);
+#endif
+#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+		enabled_features |= (1 << 9);
+#endif
+#ifdef CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+		enabled_features |= (1 << 10);
+#endif
+#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+		enabled_features |= (1 << 11);
+#endif
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+		enabled_features |= (1 << 12);
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+		enabled_features |= (1 << 13);
+#endif
+#ifdef CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
+		enabled_features |= (1 << 14);
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+		enabled_features |= (1 << 15);
+#endif
+		error = copy_to_user((void __user *)arg3, &enabled_features, sizeof(enabled_features));
+		pr_info("susfs: CMD_SUSFS_SHOW_ENABLED_FEATURES -> 0x%llx, ret: %d\n", enabled_features, error);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+	if (arg2 == CMD_SUSFS_SHOW_VARIANT) {
+		const char *variant = SUSFS_VARIANT;
+		error = copy_to_user((void __user *)arg3, variant, strlen(variant) + 1);
+		pr_info("susfs: CMD_SUSFS_SHOW_VARIANT -> %s, ret: %d\n", variant, error);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	if (arg2 == CMD_SUSFS_SHOW_SUS_SU_WORKING_MODE) {
+		int mode = susfs_get_sus_su_working_mode();
+		error = copy_to_user((void __user *)arg3, &mode, sizeof(mode));
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+	if (arg2 == CMD_SUSFS_IS_SUS_SU_READY) {
+		/* Not implemented - return not ready */
+		bool ready = false;
+		error = copy_to_user((void __user *)arg3, &ready, sizeof(ready));
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+	if (arg2 == CMD_SUSFS_SUS_SU) {
+		error = susfs_sus_su((struct st_sus_su __user *)arg3);
+		if (copy_to_user((void __user *)arg5, &error, sizeof(error)))
+			pr_err("susfs: copy_to_user failed\n");
+		return 0;
+	}
+#endif
+	/* Unknown SUSFS command - return 0 but set error to -1 */
+	error = -1;
+	if (arg5)
+		copy_to_user((void __user *)arg5, &error, sizeof(error));
 	return 0;
 }
 #endif // #ifndef CONFIG_KSU_SUSFS

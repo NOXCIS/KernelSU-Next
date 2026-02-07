@@ -6,10 +6,12 @@ struct sulog_entry {
 } __attribute__((packed));
 
 #define SULOG_ENTRY_MAX 250
-#define SULOG_BUFSIZ SULOG_ENTRY_MAX * (sizeof (struct sulog_entry))
+/* L10: Parenthesize macro to prevent precedence issues */
+#define SULOG_BUFSIZ (SULOG_ENTRY_MAX * sizeof(struct sulog_entry))
 
 static void *sulog_buf_ptr = NULL;
-static uint8_t sulog_index_next = 0;
+/* L11: Use unsigned int to avoid silent wrap if SULOG_ENTRY_MAX > 255 */
+static unsigned int sulog_index_next = 0;
 
 static DEFINE_SPINLOCK(sulog_lock);
 
@@ -19,31 +21,30 @@ void sulog_init_heap()
 	if (!sulog_buf_ptr)
 		sulog_buf_ptr = NULL;
 	
-	pr_info("sulog_init: allocated %lu bytes on 0x%p \n", SULOG_BUFSIZ, sulog_buf_ptr);
+	pr_info("sulog_init: allocated %lu bytes\n", (unsigned long)SULOG_BUFSIZ);
 }
 
 void write_sulog(uint8_t sym)
 {
+	unsigned int offset;
+	struct sulog_entry entry = {0};
+
 	if (!sulog_buf_ptr)
 		return;
-
-	unsigned int offset = sulog_index_next * sizeof(struct sulog_entry);
-	struct sulog_entry entry = {0};
 
 	// WARNING!!! this is LE only!
 	entry.s_time = (uint32_t)(ktime_get_boottime() / 1000000000);
 	entry.data = (uint32_t)current_uid().val;
-	memcpy((void *)&entry.data + 3, &sym, 1);
+	/* M14: Cast to char* for defined pointer arithmetic (void* is UB in ISO C) */
+	memcpy((char *)&entry.data + 3, &sym, 1);
 
 	spin_lock(&sulog_lock);
-	memcpy(sulog_buf_ptr + offset, &entry, sizeof(entry));
-	spin_unlock(&sulog_lock);
-
-	// move ptr for next iteration
+	offset = sulog_index_next * sizeof(struct sulog_entry);
+	memcpy((char *)sulog_buf_ptr + offset, &entry, sizeof(entry));
 	sulog_index_next = sulog_index_next + 1;
-
 	if (sulog_index_next >= SULOG_ENTRY_MAX)
 		sulog_index_next = 0;
+	spin_unlock(&sulog_lock);
 }
 
 struct sulog_entry_rcv_ptr {
@@ -54,33 +55,53 @@ struct sulog_entry_rcv_ptr {
 
 int send_sulog_dump(void __user *uptr)
 {
+	struct sulog_entry_rcv_ptr sbuf = {0};
+	void *tmp_buf;
+	unsigned int tmp_index;
+	uint32_t uptime;
+
 	if (!sulog_buf_ptr)
 		return 1;
 
-	struct sulog_entry_rcv_ptr sbuf = {0};
-
-	if (copy_from_user(&sbuf, uptr, sizeof(sbuf) ))
+	if (copy_from_user(&sbuf, uptr, sizeof(sbuf)))
 		return 1;
 
-	if (!sbuf.index_ptr || !sbuf.buf_ptr || !sbuf.uptime_ptr )
+	if (!sbuf.index_ptr || !sbuf.buf_ptr || !sbuf.uptime_ptr)
 		return 1;
 
 	// send uptime
-	uint32_t uptime = (uint32_t)(ktime_get_boottime() / 1000000000);
-	if (copy_to_user((void __user *)sbuf.uptime_ptr, &uptime, sizeof(uptime) ))
+	uptime = (uint32_t)(ktime_get_boottime() / 1000000000);
+	if (copy_to_user((void __user *)sbuf.uptime_ptr, &uptime, sizeof(uptime)))
 		return 1;
 
-	// send index
-	if (copy_to_user((void __user *)sbuf.index_ptr, &sulog_index_next, sizeof(sulog_index_next) ))
+	// snapshot buffer under lock, then copy_to_user outside lock
+	tmp_buf = kmalloc(SULOG_BUFSIZ, GFP_KERNEL);
+	if (!tmp_buf)
 		return 1;
 
-	// send buffer data
 	spin_lock(&sulog_lock);
-	if (copy_to_user((void __user *)sbuf.buf_ptr, sulog_buf_ptr, SULOG_BUFSIZ )) {
-		spin_unlock(&sulog_lock);
-		return 1;
-	}
+	memcpy(tmp_buf, sulog_buf_ptr, SULOG_BUFSIZ);
+	tmp_index = sulog_index_next;
 	spin_unlock(&sulog_lock);
 
+	if (copy_to_user((void __user *)sbuf.index_ptr, &tmp_index, sizeof(tmp_index))) {
+		kfree(tmp_buf);
+		return 1;
+	}
+
+	if (copy_to_user((void __user *)sbuf.buf_ptr, tmp_buf, SULOG_BUFSIZ)) {
+		kfree(tmp_buf);
+		return 1;
+	}
+
+	kfree(tmp_buf);
 	return 0;
+}
+
+void sulog_exit_heap(void)
+{
+	spin_lock(&sulog_lock);
+	kfree(sulog_buf_ptr);
+	sulog_buf_ptr = NULL;
+	spin_unlock(&sulog_lock);
 }

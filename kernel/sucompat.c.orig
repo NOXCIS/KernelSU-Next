@@ -35,14 +35,14 @@ bool ksu_su_compat_enabled __read_mostly = true;
 
 static int su_compat_feature_get(u64 *value)
 {
-	*value = READ_ONCE(ksu_su_compat_enabled) ? 1 : 0;
+	*value = ksu_su_compat_enabled ? 1 : 0;
 	return 0;
 }
 
 static int su_compat_feature_set(u64 value)
 {
 	bool enable = value != 0;
-	WRITE_ONCE(ksu_su_compat_enabled, enable);
+	ksu_su_compat_enabled = enable;
 	pr_info("su_compat: set to %d\n", enable);
 	return 0;
 }
@@ -54,12 +54,6 @@ static const struct ksu_feature_handler su_compat_handler = {
 	.set_handler = su_compat_feature_set,
 };
 
-/*
- * WARNING: Writing below the user stack pointer is inherently racy with
- * signal delivery. A signal frame could overwrite our data between
- * copy_to_user and the syscall consuming it. This is an accepted risk
- * in the KernelSU upstream design — the race window is nanoseconds.
- */
 static void __user *userspace_stack_buffer(const void *d, size_t len)
 {
 	// To avoid having to mmap a page in userspace, just write below the stack
@@ -100,11 +94,7 @@ int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
     if (unlikely(!memcmp(path, su, sizeof(su)))) {
         write_sulog('a');
         pr_info("faccessat su->sh!\n");
-        {
-            char __user *new_path = sh_user_path();
-            if (new_path)
-                *filename_user = new_path;
-        }
+        *filename_user = sh_user_path();
     }
 
 	return 0;
@@ -130,11 +120,7 @@ int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
     if (unlikely(!memcmp(path, su, sizeof(su)))) {
         write_sulog('s');
         pr_info("newfstatat su->sh!\n");
-        {
-            char __user *new_path = sh_user_path();
-            if (new_path)
-                *filename_user = new_path;
-        }
+        *filename_user = sh_user_path();
     }
 
 	return 0;
@@ -185,11 +171,7 @@ int ksu_handle_execve_sucompat(const char __user **filename_user,
     write_sulog('x');
 
     pr_info("sys_execve su found\n");
-    {
-        char __user *new_path = ksud_user_path();
-        if (new_path)
-            *filename_user = new_path;
-    }
+    *filename_user = ksud_user_path();
 
 	escape_with_root_profile();
 
@@ -207,7 +189,7 @@ extern bool ksu_kernel_umount_enabled;
  * return 1 -> Further checks should be continued afterwards
  */
 int ksu_handle_execveat_init(struct filename *filename) {
-	if (current->pid != 1 && is_init(current_cred())) {
+	if (current->pid != 1 && is_init(get_current_cred())) {
 		if (unlikely(strcmp(filename->name, KSUD_PATH) == 0)) {
 			pr_info("hook_manager: escape to root for init executing ksud: %d\n", current->pid);
 			escape_to_root_for_init();
@@ -242,10 +224,6 @@ int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 		return 0;
 	}
 
-	// Security: only allow su for UIDs in the allowlist (matches non-SUSFS behavior)
-	if (!ksu_is_allow_uid_for_current(current_uid().val))
-		return 0;
-
 	if (likely(memcmp(filename->name, su_path, sizeof(su_path))))
 		return 0;
 
@@ -270,26 +248,16 @@ int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
 int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
 		int *__unused_flags)
 {
-	// Security: only reveal su existence to UIDs in the allowlist
-	if (!ksu_is_allow_uid_for_current(current_uid().val)) {
-		return 0;
-	}
-
-	if (unlikely(!filename_user))
-		return 0;
-
 	char path[sizeof(su_path) + 1] = {0};
 
 	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
 
 	if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
 		pr_info("ksu_handle_faccessat: su->sh!\n");
-		{
-			char __user *new_path = sh_user_path();
-			if (new_path)
-				*filename_user = new_path;
-		}
+		*filename_user = sh_user_path();
 	}
+
+	return 0;
 
 	return 0;
 }
@@ -297,11 +265,6 @@ int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 int ksu_handle_stat(int *dfd, struct filename **filename, int *flags) {
 	if (unlikely(IS_ERR(*filename) || (*filename)->name == NULL)) {
-		return 0;
-	}
-
-	// Security: only reveal su existence to UIDs in the allowlist
-	if (!ksu_is_allow_uid_for_current(current_uid().val)) {
 		return 0;
 	}
 
@@ -320,22 +283,13 @@ int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 		return 0;
 	}
 
-	// Security: only reveal su existence to UIDs in the allowlist
-	if (!ksu_is_allow_uid_for_current(current_uid().val)) {
-		return 0;
-	}
-
 	char path[sizeof(su_path) + 1] = {0};
 
 	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
 
 	if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
 		pr_info("ksu_handle_stat: su->sh!\n");
-		{
-			char __user *new_path = sh_user_path();
-			if (new_path)
-				*filename_user = new_path;
-		}
+		*filename_user = sh_user_path();
 	}
 
 	return 0;
@@ -357,13 +311,10 @@ int ksu_handle_devpts(struct inode *inode)
 	if (!__ksu_is_allow_uid_for_current(uid))
 		return 0;
 
-	{
-		u32 fsid = READ_ONCE(ksu_file_sid);
-		if (fsid) {
-			struct inode_security_struct *sec = selinux_inode(inode);
-			if (sec) {
-				sec->sid = fsid;
-			}
+	if (ksu_file_sid) {
+		struct inode_security_struct *sec = selinux_inode(inode);
+		if (sec) {
+			sec->sid = ksu_file_sid;
 		}
 	}
 
@@ -383,24 +334,3 @@ void ksu_sucompat_exit()
 {
 	ksu_unregister_feature_handler(KSU_FEATURE_SU_COMPAT);
 }
-
-#ifdef CONFIG_KSU_SUSFS_SUS_SU
-/*
- * SUSFS sus_su support: these variables and functions are expected by
- * fs/devpts/inode.c and fs/susfs.c from the SUSFS kernel patches.
- * In the dev_susfs non-kprobe branch, enable/disable are stubs since
- * there are no kprobes to toggle.
- */
-bool ksu_devpts_hook = false;
-bool susfs_is_sus_su_ready = false;
-
-void ksu_susfs_disable_sus_su(void)
-{
-	ksu_devpts_hook = false;
-}
-
-void ksu_susfs_enable_sus_su(void)
-{
-	ksu_devpts_hook = true;
-}
-#endif // #ifdef CONFIG_KSU_SUSFS_SUS_SU

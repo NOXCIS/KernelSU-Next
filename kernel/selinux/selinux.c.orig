@@ -39,7 +39,8 @@ static int transive_to_domain(const char *domain, struct cred *cred)
     }
     error = security_secctx_to_secid(domain, strlen(domain), &sid);
     if (error) {
-        pr_info("security_secctx_to_secid %s -> error: %d\n", domain, error);
+        pr_info("security_secctx_to_secid %s -> sid: %d, error: %d\n", domain,
+                sid, error);
     }
     if (!error) {
         tsec->sid = sid;
@@ -65,7 +66,7 @@ void setup_ksu_cred(void)
     }
 }
 
-void ksu_setenforce(bool enforce)
+void setenforce(bool enforce)
 {
 #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
     selinux_state.enforcing = enforce;
@@ -115,52 +116,40 @@ void cache_sid(void)
 {
     int err;
 
-    {
-        u32 sid;
-        err = security_secctx_to_secid(KERNEL_SU_CONTEXT, strlen(KERNEL_SU_CONTEXT), &sid);
-        if (err) {
-            pr_warn("Failed to cache kernel su domain SID: %d\n", err);
-            WRITE_ONCE(cached_su_sid, 0);
-        } else {
-            WRITE_ONCE(cached_su_sid, sid);
-            pr_info("Cached su SID: %u\n", sid);
-        }
+    err = security_secctx_to_secid(KERNEL_SU_CONTEXT, strlen(KERNEL_SU_CONTEXT),
+                                   &cached_su_sid);
+    if (err) {
+        pr_warn("Failed to cache kernel su domain SID: %d\n", err);
+        cached_su_sid = 0;
+    } else {
+        pr_info("Cached su SID: %u\n", cached_su_sid);
     }
 
-    {
-        u32 sid;
-        err = security_secctx_to_secid(ZYGOTE_CONTEXT, strlen(ZYGOTE_CONTEXT), &sid);
-        if (err) {
-            pr_warn("Failed to cache zygote SID: %d\n", err);
-            WRITE_ONCE(cached_zygote_sid, 0);
-        } else {
-            WRITE_ONCE(cached_zygote_sid, sid);
-            pr_info("Cached zygote SID: %u\n", sid);
-        }
+    err = security_secctx_to_secid(ZYGOTE_CONTEXT, strlen(ZYGOTE_CONTEXT),
+                                   &cached_zygote_sid);
+    if (err) {
+        pr_warn("Failed to cache zygote SID: %d\n", err);
+        cached_zygote_sid = 0;
+    } else {
+        pr_info("Cached zygote SID: %u\n", cached_zygote_sid);
     }
 
-    {
-        u32 sid;
-        err = security_secctx_to_secid(INIT_CONTEXT, strlen(INIT_CONTEXT), &sid);
-        if (err) {
-            pr_warn("Failed to cache init SID: %d\n", err);
-            WRITE_ONCE(cached_init_sid, 0);
-        } else {
-            WRITE_ONCE(cached_init_sid, sid);
-            pr_info("Cached init SID: %u\n", sid);
-        }
+    err = security_secctx_to_secid(INIT_CONTEXT, strlen(INIT_CONTEXT),
+                                   &cached_init_sid);
+    if (err) {
+        pr_warn("Failed to cache init SID: %d\n", err);
+        cached_init_sid = 0;
+    } else {
+        pr_info("Cached init SID: %u\n", cached_init_sid);
     }
 
-    {
-        u32 sid;
-        err = security_secctx_to_secid(KSU_FILE_CONTEXT, strlen(KSU_FILE_CONTEXT), &sid);
-        if (err) {
-            pr_warn("Failed to cache ksu_file SID: %d\n", err);
-            WRITE_ONCE(ksu_file_sid, 0);
-        } else {
-            WRITE_ONCE(ksu_file_sid, sid);
-            pr_info("Cached ksu_file SID: %u\n", sid);
-        }
+    err = security_secctx_to_secid(KSU_FILE_CONTEXT, strlen(KSU_FILE_CONTEXT),
+                                   &ksu_file_sid);
+    if (err) {
+        pr_warn("Failed to cache ksu_file SID: %d\n", err);
+        ksu_file_sid = 0;
+    } else {
+        pr_info("Cached ksu_file SID: %u\n", ksu_file_sid);
     }
 }
 
@@ -169,7 +158,7 @@ void cache_sid(void)
  * Falls back to string comparison if cache is not initialized.
  */
 static bool is_sid_match(const struct cred *cred, u32 cached_sid,
-                         const char *fallback_context __maybe_unused)
+                         const char *fallback_context)
 {
     if (!cred) {
         return false;
@@ -183,22 +172,25 @@ static bool is_sid_match(const struct cred *cred, u32 cached_sid,
         return false;
     }
 
-    /*
-     * H-F + R3 fix: Return false when cache is not ready (cached_sid == 0).
-     * The previous slow path called security_secid_to_secctx which can sleep
-     * (GFP_KERNEL allocation), making it unsafe in atomic context (spinlocks).
-     * Since cache_sid() runs during on_post_fs_data, and before that point
-     * returning false is fail-safe (denies rather than grants), removing the
-     * slow path eliminates an entire class of sleeping-under-spinlock bugs.
-     */
-    if (unlikely(cached_sid == 0))
+    // Fast path: use cached SID if available
+    if (likely(cached_sid != 0)) {
+        return tsec->sid == cached_sid;
+    }
+
+    // Slow path fallback: string comparison (only before cache is initialized)
+    struct lsm_context ctx;
+    bool result;
+    if (__security_secid_to_secctx(tsec->sid, &ctx)) {
         return false;
-    return tsec->sid == cached_sid;
+    }
+    result = strncmp(fallback_context, ctx.context, ctx.len) == 0;
+    __security_release_secctx(&ctx);
+    return result;
 }
 
 bool is_task_ksu_domain(const struct cred *cred)
 {
-    return is_sid_match(cred, READ_ONCE(cached_su_sid), KERNEL_SU_CONTEXT);
+    return is_sid_match(cred, cached_su_sid, KERNEL_SU_CONTEXT);
 }
 
 bool is_ksu_domain(void)
@@ -208,12 +200,12 @@ bool is_ksu_domain(void)
 
 bool is_zygote(const struct cred *cred)
 {
-    return is_sid_match(cred, READ_ONCE(cached_zygote_sid), ZYGOTE_CONTEXT);
+    return is_sid_match(cred, cached_zygote_sid, ZYGOTE_CONTEXT);
 }
 
 bool is_init(const struct cred *cred)
 {
-    return is_sid_match(cred, READ_ONCE(cached_init_sid), INIT_CONTEXT);
+    return is_sid_match(cred, cached_init_sid, INIT_CONTEXT);
 }
 
 #ifdef CONFIG_KSU_SUSFS
@@ -235,21 +227,16 @@ static inline void susfs_set_sid(const char *secctx_name, u32 *out_sid)
         return;
     }
 
-    {
-        u32 sid;
-        err = security_secctx_to_secid(secctx_name, strlen(secctx_name), &sid);
-        if (err) {
-            pr_err("failed setting sid for '%s', err: %d\n", secctx_name, err);
-            return;
-        }
-        WRITE_ONCE(*out_sid, sid);
-        pr_info("sid '%u' is set for secctx_name '%s'\n", sid, secctx_name);
+    err = security_secctx_to_secid(secctx_name, strlen(secctx_name),
+                       out_sid);
+    if (err) {
+        pr_err("failed setting sid for '%s', err: %d\n", secctx_name, err);
+        return;
     }
+    pr_info("sid '%u' is set for secctx_name '%s'\n", *out_sid, secctx_name);
 }
 
 bool susfs_is_sid_equal(const struct cred *cred, u32 sid2) {
-    if (!cred)
-        return false;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
     const struct task_security_struct *tsec = selinux_cred(cred);
 #else
@@ -290,8 +277,7 @@ void susfs_set_zygote_sid(void)
 }
 
 bool susfs_is_current_zygote_domain(void) {
-    u32 sid = READ_ONCE(susfs_zygote_sid);
-    return sid != 0 && unlikely(current_sid() == sid);
+    return unlikely(current_sid() == susfs_zygote_sid);
 }
 
 void susfs_set_ksu_sid(void)
@@ -300,8 +286,7 @@ void susfs_set_ksu_sid(void)
 }
 
 bool susfs_is_current_ksu_domain(void) {
-    u32 sid = READ_ONCE(susfs_ksu_sid);
-    return sid != 0 && unlikely(current_sid() == sid);
+    return unlikely(current_sid() == susfs_ksu_sid);
 }
 
 void susfs_set_init_sid(void)
@@ -310,8 +295,7 @@ void susfs_set_init_sid(void)
 }
 
 bool susfs_is_current_init_domain(void) {
-    u32 sid = READ_ONCE(susfs_init_sid);
-    return sid != 0 && unlikely(current_sid() == sid);
+    return unlikely(current_sid() == susfs_init_sid);
 }
 
 void susfs_set_priv_app_sid(void)

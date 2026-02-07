@@ -1,0 +1,31 @@
+@@ -11,6 +11,10 @@
+ #include "ksu.h"
+ #include "throne_tracker.h"
+ 
++#ifdef CONFIG_KSU_SUSFS
++#include <linux/susfs.h>
++#endif
++
+ static struct workqueue_struct *ksu_workqueue;
+ 
+ bool ksu_queue_work(struct work_struct *work)
+@@ -36,6 +40,10 @@
+ 	pr_alert("*************************************************************");
+ #endif
+ 
++#ifdef CONFIG_KSU_SUSFS
++	susfs_init();
++#endif
++
+ 	ksu_core_init();
+ 
+ 	ksu_workqueue = alloc_ordered_workqueue("kernelsu_work_queue", 0);
+@@ -59,7 +67,7 @@
+ 	return 0;
+ }
+ 
+-void kernelsu_exit(void)
++void ksu_kernelsu_exit(void)
+ {
+ 	ksu_allowlist_exit();
+ 

@@ -25,8 +25,12 @@ static struct group_info root_groups = { .usage = ATOMIC_INIT(2) };
 
 void setup_groups(struct root_profile *profile, struct cred *cred)
 {
-    if (profile->groups_count > KSU_MAX_GROUPS) {
-        pr_warn("Failed to setgroups, too large group: %d!\n", profile->uid);
+    /* H-E fix: groups_count is int32_t; a negative value passes the > check
+     * (signed comparison: -1 < 32) but wraps to ~4 billion when cast to u32,
+     * causing a massive allocation attempt. Check lower bound explicitly. */
+    if (profile->groups_count < 0 || profile->groups_count > KSU_MAX_GROUPS) {
+        pr_warn("Failed to setgroups, invalid group count: %d for uid: %d!\n",
+                profile->groups_count, profile->uid);
         return;
     }
 
@@ -62,13 +66,19 @@ void setup_groups(struct root_profile *profile, struct cred *cred)
     put_group_info(group_info);
 }
 
+/* seccomp_filter_release was introduced later; on 5.4 use put_seccomp_filter */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
 void seccomp_filter_release(struct task_struct *tsk);
+#else
+extern void put_seccomp_filter(struct task_struct *tsk);
+#endif
 
 static void disable_seccomp(void)
 {
     struct task_struct *fake;
 
-    fake = kmalloc(sizeof(*fake), GFP_ATOMIC);
+    /* L2: GFP_KERNEL is safe here — allocation is before any lock */
+    fake = kmalloc(sizeof(*fake), GFP_KERNEL);
     if (!fake) {
         pr_warn("failed to alloc fake task_struct\n");
         return;
@@ -100,13 +110,18 @@ static void disable_seccomp(void)
     fake->sighand = NULL;
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
     seccomp_filter_release(fake);
+#else
+    put_seccomp_filter(fake);
+#endif
     kfree(fake);
 }
 
 void escape_with_root_profile(void)
 {
     struct cred *cred;
+    struct root_profile profile;
 #ifndef CONFIG_KSU_SUSFS
     struct task_struct *p = current;
     struct task_struct *t;
@@ -124,46 +139,52 @@ void escape_with_root_profile(void)
         return;
     }
 
-    struct root_profile *profile = ksu_get_root_profile(cred->uid.val);
+    /* C2 fix: ksu_get_root_profile copies under lock, no raw pointer */
+    ksu_get_root_profile(cred->uid.val, &profile);
 
-    cred->uid.val = profile->uid;
-    cred->suid.val = profile->uid;
-    cred->euid.val = profile->uid;
-    cred->fsuid.val = profile->uid;
+    cred->uid.val = profile.uid;
+    cred->suid.val = profile.uid;
+    cred->euid.val = profile.uid;
+    cred->fsuid.val = profile.uid;
 
-    cred->gid.val = profile->gid;
-    cred->fsgid.val = profile->gid;
-    cred->sgid.val = profile->gid;
-    cred->egid.val = profile->gid;
+    cred->gid.val = profile.gid;
+    cred->fsgid.val = profile.gid;
+    cred->sgid.val = profile.gid;
+    cred->egid.val = profile.gid;
     cred->securebits = 0;
 
-    BUILD_BUG_ON(sizeof(profile->capabilities.effective) !=
+    BUILD_BUG_ON(sizeof(profile.capabilities.effective) !=
                  sizeof(kernel_cap_t));
 
     // setup capabilities
     // we need CAP_DAC_READ_SEARCH becuase `/data/adb/ksud` is not accessible for non root process
     // we add it here but don't add it to cap_inhertiable, it would be dropped automaticly after exec!
-    u64 cap_for_ksud = profile->capabilities.effective | CAP_DAC_READ_SEARCH;
+    u64 cap_for_ksud = profile.capabilities.effective | (1ULL << CAP_DAC_READ_SEARCH);
     memcpy(&cred->cap_effective, &cap_for_ksud, sizeof(cred->cap_effective));
-    memcpy(&cred->cap_permitted, &profile->capabilities.effective,
+    memcpy(&cred->cap_permitted, &profile.capabilities.effective,
            sizeof(cred->cap_permitted));
-    memcpy(&cred->cap_bset, &profile->capabilities.effective,
+    memcpy(&cred->cap_bset, &profile.capabilities.effective,
            sizeof(cred->cap_bset));
 
-    setup_groups(profile, cred);
-    setup_selinux(profile->selinux_domain, cred);
+    setup_groups(&profile, cred);
+    setup_selinux(profile.selinux_domain, cred);
 
     commit_creds(cred);
 
     disable_seccomp();
 
+    /* H-B fix: for_each_thread traverses the RCU-protected thread_group list.
+     * Without rcu_read_lock, a concurrent exit_group can free a task_struct
+     * mid-iteration, causing a use-after-free. */
 #ifndef CONFIG_KSU_SUSFS
+    rcu_read_lock();
     for_each_thread (p, t) {
         ksu_set_task_tracepoint_flag(t);
     }
+    rcu_read_unlock();
 #endif // #ifndef CONFIG_KSU_SUSFS
 
-    setup_mount_ns(profile->namespaces);
+    setup_mount_ns(profile.namespaces);
 }
 
 void escape_to_root_for_init(void)

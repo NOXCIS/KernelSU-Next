@@ -22,14 +22,14 @@ static bool ksu_kernel_umount_enabled = true;
 
 static int kernel_umount_feature_get(u64 *value)
 {
-	*value = ksu_kernel_umount_enabled ? 1 : 0;
+	*value = READ_ONCE(ksu_kernel_umount_enabled) ? 1 : 0;
 	return 0;
 }
 
 static int kernel_umount_feature_set(u64 value)
 {
 	bool enable = value != 0;
-	ksu_kernel_umount_enabled = enable;
+	WRITE_ONCE(ksu_kernel_umount_enabled, enable);
 	pr_info("kernel_umount: set to %d\n", enable);
 	return 0;
 }
@@ -45,9 +45,18 @@ extern int path_umount(struct path *path, int flags);
 
 static void ksu_umount_mnt(struct path *path, int flags)
 {
-	int err = path_umount(path, flags);
+	/* Capture name BEFORE path_umount, which calls dput+mntput and may
+	 * free the dentry. d_iname is a fixed inline array so memcpy is safe
+	 * as long as the dentry is still alive (which it is here). */
+	char name_buf[DNAME_INLINE_LEN];
+	int err;
+
+	memcpy(name_buf, path->dentry->d_iname, sizeof(name_buf));
+	name_buf[sizeof(name_buf) - 1] = '\0';
+
+	err = path_umount(path, flags);
 	if (err) {
-		pr_info("umount %s failed: %d\n", path->dentry->d_iname, err);
+		pr_info("umount %s failed: %d\n", name_buf, err);
 	}
 }
 
@@ -66,16 +75,30 @@ static void try_umount(const char *mnt, int flags)
 	}
 
     ksu_umount_mnt(&path, flags);
+    /* NOTE: path_umount() internally calls dput + mntput, so NO path_put here */
 }
+
+#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+/*
+ * Exported version of try_umount for SUSFS.
+ * The check_mnt and uid parameters are accepted for API compat but
+ * the underlying implementation just does kern_path + umount.
+ */
+void ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid)
+{
+	try_umount(mnt, flags);
+}
+#endif
 
 struct umount_tw {
 	struct callback_head cb;
+	const struct cred *cred_ref; /* M13: hold reference to avoid TOCTOU UAF */
 };
 
 static void umount_tw_func(struct callback_head *cb)
 {
 	struct umount_tw *tw = container_of(cb, struct umount_tw, cb);
-	const struct cred *saved = override_creds(ksu_cred);
+	const struct cred *saved = override_creds(tw->cred_ref);
 
     struct mount_entry *entry;
     down_read(&mount_list_lock);
@@ -87,7 +110,7 @@ static void umount_tw_func(struct callback_head *cb)
     up_read(&mount_list_lock);
 
 	revert_creds(saved);
-
+	put_cred(tw->cred_ref);
 	kfree(tw);
 }
 
@@ -96,11 +119,11 @@ int ksu_handle_umount(uid_t old_uid, uid_t new_uid)
 	struct umount_tw *tw;
 
 	// if there isn't any module mounted, just ignore it!
-	if (!ksu_module_mounted) {
+	if (!READ_ONCE(ksu_module_mounted)) {
 		return 0;
 	}
 
-	if (!ksu_kernel_umount_enabled) {
+	if (!READ_ONCE(ksu_kernel_umount_enabled)) {
 		return 0;
 	}
 
@@ -127,7 +150,7 @@ int ksu_handle_umount(uid_t old_uid, uid_t new_uid)
 	// because some su apps may setuid to untrusted_app but they are in global mount namespace
 	// when we umount for such process, that is a disaster!
 	// also handle case 4 and 5
-	bool is_zygote_child = is_zygote(get_current_cred());
+	bool is_zygote_child = is_zygote(current_cred());
 	if (!is_zygote_child) {
 		pr_info("handle umount ignore non zygote child: %d\n", current->pid);
 		return 0;
@@ -141,10 +164,14 @@ int ksu_handle_umount(uid_t old_uid, uid_t new_uid)
 	if (!tw)
 		return 0;
 
+	/* M13: Take cred reference now to prevent UAF if ksu_cred is freed
+	 * between scheduling and task_work execution */
+	tw->cred_ref = get_cred(ksu_cred);
 	tw->cb.func = umount_tw_func;
 
 	int err = task_work_add(current, &tw->cb, TWA_RESUME);
 	if (err) {
+		put_cred(tw->cred_ref);
 		kfree(tw);
 		pr_warn("unmount add task_work failed\n");
 	}

@@ -265,6 +265,8 @@ int ksu_handle_init_mark_tracker(const char __user **filename_user)
 		ret = strncpy_from_user_nofault(path, fn, sizeof(path));
 		pr_info("ksu_handle_init_mark_tracker: %ld\n", ret);
 	}
+	/* C6: Force NUL-termination to prevent stack buffer over-read */
+	path[sizeof(path) - 1] = '\0';
 
     if (unlikely(strcmp(path, KSUD_PATH) == 0)) {
         pr_info("hook_manager: escape to root for init executing ksud: %d\n",
@@ -309,7 +311,8 @@ static void ksu_sys_enter_handler(void *data, struct pt_regs *regs, long id)
             if (id == __NR_execve) {
                 const char __user **filename_user =
                     (const char __user **)&PT_REGS_PARM1(regs);
-                if (current->pid != 1 && is_init(get_current_cred())) {
+                /* C4: use current_cred() to avoid cred refcount leak */
+                if (current->pid != 1 && is_init(current_cred())) {
                     ksu_handle_init_mark_tracker(filename_user);
                 } else {
                     ksu_handle_execve_sucompat(filename_user, NULL, NULL, NULL);
